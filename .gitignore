@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env
+.env
+.venv/
+venv/
+conda-meta/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+log/
+logs/
+*.log
+*.out
+*.err
+
+# Results / outputs
+playground/results/
+outputs/
+tmp/
+temp/
+cache/
+
+# Model / dataset
+videorope_exp/checkpoints/
+videorope_exp/datasets/
+checkpoints/
+datasets/
+data/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Media / large files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.tar
+*.gz
+*.zip
+*.7z
+
+# HF / cache
+.cache/
+huggingface/
+hf_cache/
+
+# Runtime / profiling
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Torch / compile
+*.cu
+*.o
+*.a
+
+# Generated eval files
+*.jsonl
+*_errors.jsonl
+
+# Optional: if you do want to keep some result jsons, comment out below
+# playground/results/**/*.json
