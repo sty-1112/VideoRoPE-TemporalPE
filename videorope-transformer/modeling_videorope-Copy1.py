@@ -1502,213 +1502,6 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
-
-    def _build_temporalpe_tau_from_video_embeds(
-        self,
-        video_embeds: torch.Tensor,
-        video_grid_thw: torch.LongTensor,
-        scale_factor: float = 2.0,
-        eps: float = 1e-6,
-    ):
-        """
-        video_embeds: [sum_i (T_i * H_i' * W_i'), D]
-        video_grid_thw: [num_videos, 3], each row = [T, H, W] before spatial_merge
-        return: list[tensor], each tensor shape [T_i], float tau for one video
-        """
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        tau_list = []
-        st = 0
-    
-        for grid in video_grid_thw:
-            t, h, w = [int(x) for x in grid.tolist()]
-            gh = h // spatial_merge_size
-            gw = w // spatial_merge_size
-            num_tokens = t * gh * gw
-    
-            cur = video_embeds[st: st + num_tokens]   # [T*P, D]
-            st += num_tokens
-    
-            cur = cur.view(t, gh * gw, -1).float()    # [T, P, D]
-            cur = F.layer_norm(cur, (cur.shape[-1],))
-    
-            # frame-level descriptor
-            frame_feat = cur.mean(dim=1)              # [T, D]
-    
-            if t <= 1:
-                tau = torch.zeros(t, device=cur.device, dtype=torch.float32)
-            else:
-                diff = frame_feat[1:] - frame_feat[:-1]      # [T-1, D]
-                e = diff.pow(2).mean(dim=-1)                 # [T-1]
-    
-                # optional smoothing
-                if e.numel() >= 3:
-                    e = F.avg_pool1d(
-                        e[None, None, :], kernel_size=3, stride=1, padding=1
-                    ).squeeze(0).squeeze(0)
-    
-                q = e.mean().clamp_min(eps)
-                z = torch.cat(
-                    [torch.zeros(1, device=e.device, dtype=e.dtype), e / q],
-                    dim=0
-                )                                           # [T]
-    
-                tau = torch.cumsum(z, dim=0)                # [T]
-    
-            tau = tau * float(scale_factor)
-            tau_list.append(tau)
-    
-        return tau_list
-    
-    
-    def get_temporalpe_videorope_index(
-        self,
-        input_ids: torch.LongTensor,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        video_tau_list: Optional[list] = None,
-        scale_factor: float = 2.0,
-    ):
-        """
-        Keep VideoRoPE's diagonal x/y layout unchanged.
-        Replace only temporal index t with reconstructed tau.
-        """
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_id
-        video_token_id = self.config.video_token_id
-        vision_start_token_id = self.config.vision_start_token_id
-    
-        mrope_position_deltas = []
-    
-        if image_grid_thw is not None or video_grid_thw is not None:
-            total_input_ids = input_ids
-            position_ids = torch.ones(
-                3, input_ids.shape[0], input_ids.shape[1],
-                dtype=torch.float32, device=input_ids.device
-            )
-    
-            image_index, video_index = 0, 0
-    
-            for i, cur_input_ids in enumerate(total_input_ids):
-                if attention_mask is not None:
-                    cur_input_ids = cur_input_ids[attention_mask[i] == 1]
-    
-                vision_start_indices = torch.argwhere(cur_input_ids == vision_start_token_id).squeeze(1)
-                vision_tokens = cur_input_ids[vision_start_indices + 1]
-    
-                image_nums = (vision_tokens == image_token_id).sum()
-                video_nums = (vision_tokens == video_token_id).sum()
-    
-                input_tokens = cur_input_ids.tolist()
-                llm_pos_ids_list = []
-                st = 0
-                remain_images, remain_videos = image_nums, video_nums
-    
-                for _ in range(image_nums + video_nums):
-                    if image_token_id in input_tokens and remain_images > 0:
-                        ed_image = input_tokens.index(image_token_id, st)
-                    else:
-                        ed_image = len(input_tokens) + 1
-    
-                    if video_token_id in input_tokens and remain_videos > 0:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    else:
-                        ed_video = len(input_tokens) + 1
-    
-                    is_image = ed_image < ed_video
-                    if is_image:
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
-                        )
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-                    else:
-                        t, h, w = (
-                            video_grid_thw[video_index][0],
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
-                        ed = ed_video
-                        remain_videos -= 1
-    
-                    llm_grid_t = int(t.item())
-                    llm_grid_h = int(h.item() // spatial_merge_size)
-                    llm_grid_w = int(w.item() // spatial_merge_size)
-                    text_len = ed - st
-    
-                    st_idx = llm_pos_ids_list[-1][0].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len, device=input_ids.device, dtype=torch.float32)
-                        .view(1, -1).expand(3, -1) + st_idx
-                    )
-    
-                    if is_image:
-                        # image case: keep original VideoRoPE linear temporal spacing
-                        base_t = torch.arange(
-                            llm_grid_t, device=input_ids.device, dtype=torch.float32
-                        ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
-                        base_t = base_t * float(scale_factor)
-                    else:
-                        # video case: replace temporal index with reconstructed tau
-                        tau = video_tau_list[video_index].to(input_ids.device).float()   # [T]
-                        base_t = tau.view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
-                        video_index += 1
-    
-                    h_index = torch.arange(
-                        llm_grid_h, device=input_ids.device, dtype=torch.float32
-                    ).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten() - (llm_grid_h - 1) // 2
-    
-                    w_index = torch.arange(
-                        llm_grid_w, device=input_ids.device, dtype=torch.float32
-                    ).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten() - (llm_grid_w - 1) // 2
-    
-                    t_index = base_t + text_len + st_idx
-                    h_index = h_index + t_index
-                    w_index = w_index + t_index
-    
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]))
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-    
-                if st < len(input_tokens):
-                    st_idx = llm_pos_ids_list[-1][0].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len, device=input_ids.device, dtype=torch.float32)
-                        .view(1, -1).expand(3, -1) + st_idx
-                    )
-    
-                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
-    
-                # keep generation cache logic compatible
-                mrope_position_deltas.append(llm_positions[0].max() + 1 - len(total_input_ids[i]))
-    
-            mrope_position_deltas = torch.tensor(
-                mrope_position_deltas, device=input_ids.device, dtype=torch.float32
-            ).unsqueeze(1)
-    
-            return position_ids, mrope_position_deltas
-    
-        # pure text fallback
-        if attention_mask is not None:
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device).float()
-            max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
-            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-        else:
-            position_ids = (
-                torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.float32)
-                .view(1, 1, -1).expand(3, input_ids.shape[0], -1)
-            )
-            mrope_position_deltas = torch.zeros(
-                [input_ids.shape[0], 1], device=input_ids.device, dtype=torch.float32
-            )
-    
-        return position_ids, mrope_position_deltas
     
     #! MODIFY position_ids
     def get_t_scale_rope_index(
@@ -2306,29 +2099,12 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                     position_ids, _ = self.get_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
-
+                #! apply position_ids when training
                 elif self.which_rope == 'videorope':
                     scale_factor = 2.0
                     position_ids, _ = self.get_t_scale_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask, scale_factor=scale_factor
                     )
-
-                elif self.which_rope == 'temporalpe_videorope':
-                    scale_factor = 2.0
-                    if pixel_values_videos is None:
-                        raise ValueError("temporalpe_videorope requires pixel_values_videos")
-                    video_tau_list = self._build_temporalpe_tau_from_video_embeds(
-                        video_embeds.float(), video_grid_thw, scale_factor=scale_factor
-                    )
-                    position_ids, _ = self.get_temporalpe_videorope_index(
-                        input_ids,
-                        image_grid_thw,
-                        video_grid_thw,
-                        attention_mask,
-                        video_tau_list=video_tau_list,
-                        scale_factor=scale_factor,
-                    )
-
                 elif self.which_rope == 'tad_rope':
                     position_ids, _ = self.get_time_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
@@ -2337,12 +2113,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
                     position_ids = position_ids + position_ids_origin
-
                 elif self.which_rope == 'vanilla_rope':
                     position_ids, _ = self.get_vanilla_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
-
                 else:
                     raise ValueError(f"have not this type of rope {self.which_rope}")
 
@@ -2429,42 +2203,16 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                     position_ids, rope_deltas = self.get_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
-
+                #! apply position_ids when inference
                 elif which_rope == 'videorope':
                     scale_factor = 2.0
                     position_ids, rope_deltas = self.get_t_scale_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask, scale_factor=scale_factor
                     )
-
-                elif which_rope == 'temporalpe_videorope':
-                    scale_factor = 2.0 if scale_factor is None else float(scale_factor)
-
-                    if pixel_values_videos is None:
-                        raise ValueError("temporalpe_videorope requires pixel_values_videos")
-
-                    pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
-                    video_embeds_for_tau = self.visual(pixel_values_videos, grid_thw=video_grid_thw).float()
-
-                    video_tau_list = self._build_temporalpe_tau_from_video_embeds(
-                        video_embeds_for_tau,
-                        video_grid_thw,
-                        scale_factor=scale_factor,
-                    )
-
-                    position_ids, rope_deltas = self.get_temporalpe_videorope_index(
-                        input_ids,
-                        image_grid_thw,
-                        video_grid_thw,
-                        attention_mask,
-                        video_tau_list=video_tau_list,
-                        scale_factor=scale_factor,
-                    )
-
                 elif which_rope == 'vanilla_rope':
                     position_ids, rope_deltas = self.get_vanilla_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
-
                 elif which_rope == 'tad_rope':
                     position_ids, rope_deltas = self.get_time_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
@@ -2473,7 +2221,6 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
                     position_ids = position_ids + position_ids_origin
-
                 else:
                     raise ValueError(f"have not this type of rope {which_rope}")
                 
