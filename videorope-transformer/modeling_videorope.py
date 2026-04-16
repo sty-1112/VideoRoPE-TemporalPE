@@ -1654,6 +1654,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                     else:
                         # video case: replace temporal index with reconstructed tau
                         tau = video_tau_list[video_index].to(input_ids.device).float()   # [T]
+                        # print("video tau:", tau)
                         base_t = tau.view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
                         video_index += 1
     
@@ -2320,6 +2321,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                     video_tau_list = self._build_temporalpe_tau_from_video_embeds(
                         video_embeds.float(), video_grid_thw, scale_factor=scale_factor
                     )
+                    print(video_tau_list)
                     position_ids, _ = self.get_temporalpe_videorope_index(
                         input_ids,
                         image_grid_thw,

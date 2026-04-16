@@ -63,11 +63,11 @@ CONTEXT_LENGTHS=(8192 16384 32768)
 # )
 
 MODEL_LIST=(
-  "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video videorope 2.0"
+  # "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video videorope 2.0"
   "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video temporalpe_videorope 2.0"
-  "Qwen2-VL-vanilla_rope-128frames-8k-context-330k-llava-video vanilla_rope 1.0"
-  "Qwen2-VL-tad_rope-128frames-8k-context-330k-llava-video tad_rope 1.0"
-  "Qwen2-VL-m_rope-128frames-8k-context-330k-llava-video m_rope 1.0"
+  # "Qwen2-VL-vanilla_rope-128frames-8k-context-330k-llava-video vanilla_rope 1.0"
+  # "Qwen2-VL-tad_rope-128frames-8k-context-330k-llava-video tad_rope 1.0"
+  # "Qwen2-VL-m_rope-128frames-8k-context-330k-llava-video m_rope 1.0"
 )
 
 echo "[INFO] REPO_ROOT=${REPO_ROOT}"
