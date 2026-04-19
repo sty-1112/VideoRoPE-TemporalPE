@@ -39,30 +39,19 @@ tmp/
 temp/
 cache/
 
-# Local reference repos
-third_party/videoweave_ref/
-
-# Checkpoints / datasets (keep processing code, ignore heavy artifacts)
+# Model / dataset
 videorope_exp/checkpoints/
 videorope_exp/datasets/
 checkpoints/
 datasets/
 data/
-
-# Keep processing / recipe code in repo
-!videorope_exp/tools/
-!videorope_exp/tools/**
-!videorope_exp/recipes/
-!videorope_exp/recipes/**
-
-# Model weights / binaries
 *.pt
 *.pth
 *.bin
 *.safetensors
 *.ckpt
 
-# Media / archives / large files
+# Media / large files
 *.mp4
 *.avi
 *.mov
@@ -89,7 +78,7 @@ hf_cache/
 *.o
 *.a
 
-# Generated eval / manifest files
+# Generated eval files
 *.jsonl
 *_errors.jsonl
 

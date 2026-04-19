@@ -1,0 +1,20 @@
+subsampling: {}
+
+reading:
+  yt_args:
+    download_size: 360
+    download_audio_rate: 44100
+  yt_metadata_args: null
+  timeout: 20
+  sampler: null
+
+storage:
+  number_sample_per_shard: 100
+  oom_shard_count: 0
+  captions_are_subtitles: false
+
+distribution:
+  processes_count: 1
+  thread_count: 1
+  subjob_size: 1
+  distributor: "multiprocessing"
