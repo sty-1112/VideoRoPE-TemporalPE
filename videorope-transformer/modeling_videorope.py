@@ -1479,7 +1479,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # set which_rope mode at llama-factory: /mnt/petrelfs/weixilin/projects/MLLM/LLaMA-Factory/src/llamafactory/model/loader.py
-        self.which_rope = None
+        self.which_rope = "m_rope"
         self.padding_side = "left"  # set it to left by default, user can use setter to change padding_sides
 
         # Initialize weights and apply final processing
@@ -1558,6 +1558,96 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             tau_list.append(tau)
     
         return tau_list
+
+    def _resolve_which_rope(self, which_rope: Optional[str] = None) -> str:
+        if which_rope is None:
+            which_rope = getattr(self, "which_rope", None)
+        if which_rope is None or which_rope == "":
+            which_rope = "m_rope"
+        return str(which_rope)
+    
+    
+    def _activate_videorope_rotary_kernel(self, which_rope: str) -> None:
+        if "videorope" in which_rope:
+            global apply_multimodal_rotary_pos_emb
+            apply_multimodal_rotary_pos_emb = apply_m_modify_multimodal_rotary_pos_emb
+    
+    
+    def _build_position_ids_by_rope_type(
+        self,
+        which_rope: str,
+        input_ids: torch.LongTensor,
+        image_grid_thw: Optional[torch.LongTensor],
+        video_grid_thw: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.Tensor],
+        video_embeds_for_tau: Optional[torch.Tensor] = None,
+        scale_factor: float = 2.0,
+    ):
+        which_rope = self._resolve_which_rope(which_rope)
+        self._activate_videorope_rotary_kernel(which_rope)
+    
+        if which_rope == "m_rope":
+            return self.get_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+            )
+    
+        if which_rope == "videorope":
+            scale_factor = 2.0 if scale_factor is None else float(scale_factor)
+            return self.get_t_scale_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+                scale_factor=scale_factor,
+            )
+    
+        if which_rope == "temporalpe_videorope":
+            scale_factor = 2.0 if scale_factor is None else float(scale_factor)
+            if video_embeds_for_tau is None:
+                raise ValueError("temporalpe_videorope requires video_embeds_for_tau")
+    
+            video_tau_list = self._build_temporalpe_tau_from_video_embeds(
+                video_embeds_for_tau.float(),
+                video_grid_thw,
+                scale_factor=scale_factor,
+            )
+    
+            return self.get_temporalpe_videorope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+                video_tau_list=video_tau_list,
+                scale_factor=scale_factor,
+            )
+    
+        if which_rope == "tad_rope":
+            position_ids, rope_deltas = self.get_time_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+            )
+            position_ids_origin, _ = self.get_vanilla_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+            )
+            return position_ids + position_ids_origin, rope_deltas
+    
+        if which_rope == "vanilla_rope":
+            return self.get_vanilla_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask,
+            )
+    
+        raise ValueError(f"have not this type of rope {which_rope}")
     
     
     def get_temporalpe_videorope_index(
@@ -2285,8 +2375,58 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
                 video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-                video_mask = (input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            
+                if video_embeds is None:
+                    raise RuntimeError("video_embeds is None")
+            
+                if video_grid_thw is None:
+                    raise RuntimeError("video_grid_thw is None while pixel_values_videos is not None")
+            
+                video_mask_token = (input_ids == self.config.video_token_id)
+                num_video_tokens_in_input = int(video_mask_token.sum().item())
+                num_video_features = int(video_embeds.shape[0])
+            
+                print(
+                    f"[DEBUG] video scatter check: "
+                    f"input_ids.shape={tuple(input_ids.shape)}, "
+                    f"inputs_embeds.shape={tuple(inputs_embeds.shape)}, "
+                    f"video_embeds.shape={tuple(video_embeds.shape)}, "
+                    f"video_grid_thw.shape={tuple(video_grid_thw.shape)}, "
+                    f"video_grid_thw={video_grid_thw.detach().cpu().tolist()}, "
+                    f"num_video_tokens_in_input={num_video_tokens_in_input}, "
+                    f"num_video_features={num_video_features}, "
+                    f"video_token_id={self.config.video_token_id}"
+                )
+            
+                if num_video_tokens_in_input != num_video_features:
+                    raise RuntimeError(
+                        "Mismatch between video placeholder tokens and video features: "
+                        f"num_video_tokens_in_input={num_video_tokens_in_input}, "
+                        f"num_video_features={num_video_features}, "
+                        f"video_grid_thw={video_grid_thw.detach().cpu().tolist()}"
+                    )
+            
+                video_mask = video_mask_token.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+                video_embeds = video_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            
+                num_masked_elements = int(video_mask.sum().item())
+                num_video_embed_elements = int(video_embeds.numel())
+            
+                print(
+                    f"[DEBUG] masked_scatter check: "
+                    f"num_masked_elements={num_masked_elements}, "
+                    f"num_video_embed_elements={num_video_embed_elements}"
+                )
+            
+                if num_masked_elements != num_video_embed_elements:
+                    raise RuntimeError(
+                        "masked_scatter element count mismatch: "
+                        f"num_masked_elements={num_masked_elements}, "
+                        f"num_video_embed_elements={num_video_embed_elements}, "
+                        f"inputs_embeds.shape={tuple(inputs_embeds.shape)}, "
+                        f"video_embeds.shape={tuple(video_embeds.shape)}"
+                    )
+            
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
             if attention_mask is not None:
@@ -2296,57 +2436,24 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             
             # import pdb; pdb.set_trace()
             if position_ids is None and input_ids is not None:
-                # self.which_rope = 'm_modify_rope' # m_rope, tad_rope, vanilla_rope, videorope
-                rank0_print(f"{self.which_rope=}")
-                #! apply apply_m_modify_multimodal_rotary_pos_emb when training
-                if 'videorope' in self.which_rope:
-                    
-                    global apply_multimodal_rotary_pos_emb
-                    apply_multimodal_rotary_pos_emb = apply_m_modify_multimodal_rotary_pos_emb
-                if self.which_rope == 'm_rope':
-                    position_ids, _ = self.get_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-
-                elif self.which_rope == 'videorope':
-                    scale_factor = 2.0
-                    position_ids, _ = self.get_t_scale_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask, scale_factor=scale_factor
-                    )
-
-                elif self.which_rope == 'temporalpe_videorope':
-                    scale_factor = 2.0
+                which_rope = self._resolve_which_rope(self.which_rope)
+                rank0_print(f"{which_rope=}")
+            
+                video_embeds_for_tau = None
+                if which_rope == "temporalpe_videorope":
                     if pixel_values_videos is None:
                         raise ValueError("temporalpe_videorope requires pixel_values_videos")
-                    video_tau_list = self._build_temporalpe_tau_from_video_embeds(
-                        video_embeds.float(), video_grid_thw, scale_factor=scale_factor
-                    )
-                    print(video_tau_list)
-                    position_ids, _ = self.get_temporalpe_videorope_index(
-                        input_ids,
-                        image_grid_thw,
-                        video_grid_thw,
-                        attention_mask,
-                        video_tau_list=video_tau_list,
-                        scale_factor=scale_factor,
-                    )
-
-                elif self.which_rope == 'tad_rope':
-                    position_ids, _ = self.get_time_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-                    position_ids_origin, _ = self.get_vanilla_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-                    position_ids = position_ids + position_ids_origin
-
-                elif self.which_rope == 'vanilla_rope':
-                    position_ids, _ = self.get_vanilla_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-
-                else:
-                    raise ValueError(f"have not this type of rope {self.which_rope}")
+                    video_embeds_for_tau = video_embeds.float()
+            
+                position_ids, _ = self._build_position_ids_by_rope_type(
+                    which_rope=which_rope,
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                    video_embeds_for_tau=video_embeds_for_tau,
+                    scale_factor=2.0,
+                )
 
         outputs = self.model(
             input_ids=None,
@@ -2417,67 +2524,28 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                 input_ids = input_ids[:, cache_position]
 
         rope_deltas = kwargs.get("rope_deltas", None)
+        which_rope = self._resolve_which_rope(which_rope)
+        
         if attention_mask is not None and position_ids is None:
             if cache_position is None or (cache_position is not None and cache_position[0] == 0):
-                #! apply apply_m_modify_multimodal_rotary_pos_emb when inference
-                if 'videorope' in which_rope:
-                    global apply_multimodal_rotary_pos_emb
-                    # apply_m_modify_x_y_sequential_multimodal_rotary_pos_emb
-                    # apply_m_modify_multimodal_rotary_pos_emb
-                    apply_multimodal_rotary_pos_emb = apply_m_modify_multimodal_rotary_pos_emb
                 rank0_print(f"{which_rope=}")
-                # import pdb; pdb.set_trace()
-                if which_rope == 'm_rope':
-                    position_ids, rope_deltas = self.get_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-
-                elif which_rope == 'videorope':
-                    scale_factor = 2.0
-                    position_ids, rope_deltas = self.get_t_scale_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask, scale_factor=scale_factor
-                    )
-
-                elif which_rope == 'temporalpe_videorope':
-                    scale_factor = 2.0 if scale_factor is None else float(scale_factor)
-
+        
+                video_embeds_for_tau = None
+                if which_rope == "temporalpe_videorope":
                     if pixel_values_videos is None:
                         raise ValueError("temporalpe_videorope requires pixel_values_videos")
-
                     pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
                     video_embeds_for_tau = self.visual(pixel_values_videos, grid_thw=video_grid_thw).float()
-
-                    video_tau_list = self._build_temporalpe_tau_from_video_embeds(
-                        video_embeds_for_tau,
-                        video_grid_thw,
-                        scale_factor=scale_factor,
-                    )
-
-                    position_ids, rope_deltas = self.get_temporalpe_videorope_index(
-                        input_ids,
-                        image_grid_thw,
-                        video_grid_thw,
-                        attention_mask,
-                        video_tau_list=video_tau_list,
-                        scale_factor=scale_factor,
-                    )
-
-                elif which_rope == 'vanilla_rope':
-                    position_ids, rope_deltas = self.get_vanilla_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-
-                elif which_rope == 'tad_rope':
-                    position_ids, rope_deltas = self.get_time_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-                    position_ids_origin, _ = self.get_vanilla_rope_index(
-                        input_ids, image_grid_thw, video_grid_thw, attention_mask
-                    )
-                    position_ids = position_ids + position_ids_origin
-
-                else:
-                    raise ValueError(f"have not this type of rope {which_rope}")
+        
+                position_ids, rope_deltas = self._build_position_ids_by_rope_type(
+                    which_rope=which_rope,
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                    video_embeds_for_tau=video_embeds_for_tau,
+                    scale_factor=scale_factor,
+                )
                 
             else:
                 

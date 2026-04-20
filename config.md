@@ -11,6 +11,8 @@
       pip install transformers==4.45.2 accelerate==0.34.2 tokenizers==0.20.1 safetensors==0.4.5 sentencepiece==0.2.0 numpy==1.26.1 pillow==10.4.0 requests==2.32.3 tqdm==4.67.1 av==13.1.0 decord==0.6.0 opencv-python==4.10.0.84 qwen-vl-utils==0.0.14
 
       MAX_JOBS=4 pip install flash-attn --no-build-isolation -v
+
+      pip install -r ./LLaMA-Factory/requirements.txt
     ```
 
   ## videorope-vllm

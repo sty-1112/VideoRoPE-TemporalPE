@@ -1,4 +1,5 @@
 import math
+import math
 from copy import deepcopy
 from io import BytesIO
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
@@ -9,21 +10,43 @@ from typing_extensions import override
 
 from ..extras.constants import IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.packages import is_pillow_available, is_pyav_available
+
 import os
-import tempfile
-# from decord import VideoReader
-from petrel_client.client import Client
 import tempfile
 from PIL import Image, ImageSequence
 import numpy as np
 import decord.logging
 
-# 设置日志级别为 QUIET，完全禁用日志输出
 decord.logging.set_level(decord.logging.QUIET)
 from decord import VideoReader, cpu
-
 from qwen_vl_utils import process_vision_info
-client = Client()
+
+try:
+    from petrel_client.client import Client  # optional, only needed for s3:// paths
+except ImportError:
+    Client = None
+
+client = Client() if Client is not None else None
+
+def _get_env_int(name: str, default: int = 0) -> int:
+    value = os.getenv(name, "")
+    if value == "":
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+def _resolve_fixed_video_frames(kwargs) -> int:
+    value = kwargs.get("fixed_video_frames", None)
+    if value is None:
+        value = _get_env_int("LLAMAFACTORY_FIXED_VIDEO_FRAMES", 0)
+    try:
+        value = int(value)
+    except Exception:
+        value = 0
+    return max(value, 0)
+    
 def proxy():
     os.environ['http_proxy'] = ''
     os.environ['https_proxy'] = ''
@@ -128,28 +151,50 @@ class BasePlugin:
 
     def _get_video_sample_frames_av(self, video_stream: "Stream", **kwargs) -> int:
         r"""
-        Computes video sample frames according to fps.
+        Computes video sample frames according to fps or a fixed-frame override.
         """
-        video_fps: float = kwargs.get("video_fps")
         video_maxlen: int = kwargs.get("video_maxlen")
-        total_frames = video_stream.frames
+        total_frames = int(video_stream.frames)
+    
+        fixed_video_frames = _resolve_fixed_video_frames(kwargs)
+        if fixed_video_frames > 0:
+            sample_frames = min(total_frames, video_maxlen, fixed_video_frames)
+            sample_frames = max(1, int(sample_frames))
+            if sample_frames > 1:
+                sample_frames = sample_frames // 2 * 2
+                sample_frames = max(2, sample_frames)
+            return sample_frames
+    
+        video_fps: float = kwargs.get("video_fps")
         sample_frames = float(video_stream.duration * video_stream.time_base) * video_fps
         sample_frames = min(total_frames, video_maxlen, sample_frames)
-        sample_frames = sample_frames // 2 * 2
-        return math.floor(sample_frames)
+        sample_frames = max(1, int(math.floor(sample_frames)))
+        if sample_frames > 1:
+            sample_frames = sample_frames // 2 * 2
+            sample_frames = max(2, sample_frames)
+        return sample_frames
     
     ## modify
     def _get_video_sample_frames(self, video_stream, **kwargs) -> int:
         r"""
-        Computes video sample frames according to fps.
+        Computes video sample frames according to fps or a fixed-frame override.
         """
-        video_fps: float = kwargs.get("video_fps")
         video_maxlen: int = kwargs.get("video_maxlen")
-        real_fps = video_stream.get_avg_fps()
-        total_frames = len(video_stream)
+        total_frames = int(len(video_stream))
+    
+        fixed_video_frames = _resolve_fixed_video_frames(kwargs)
+        if fixed_video_frames > 0:
+            sample_frames = min(total_frames, video_maxlen, fixed_video_frames)
+            return max(1, int(sample_frames))
+    
+        video_fps: float = kwargs.get("video_fps")
+        real_fps = float(video_stream.get_avg_fps())
+        if real_fps <= 0:
+            return max(1, min(total_frames, video_maxlen))
+    
         sample_frames = float(total_frames / real_fps) * video_fps
         sample_frames = min(total_frames, video_maxlen, sample_frames)
-        return math.floor(sample_frames)
+        return max(1, int(math.floor(sample_frames)))
 
     def _regularize_images(self, images: Sequence["ImageInput"], **kwargs) -> List["ImageObject"]:
         r"""
@@ -228,16 +273,17 @@ class BasePlugin:
         """
         处理标准视频文件并返回提取的帧。
         """
-        frames = []
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frames = len(vr)
+        if total_frames <= 0:
+            raise ValueError(f"Empty video: {video_path}")
+    
         sample_frames = self._get_video_sample_frames(vr, **kwargs)
-        sample_indices = np.linspace(0, total_frames - 1, sample_frames).astype(np.int32)
-        
-        # 批量读取指定帧
+        sample_frames = max(1, min(total_frames, int(sample_frames)))
+        sample_indices = np.linspace(0, total_frames - 1, sample_frames).round().astype(np.int32)
+    
         batch_frames = vr.get_batch(sample_indices).asnumpy()
         frames = [Image.fromarray(frame) for frame in batch_frames]
-        
         return frames
 
     def _regularize_videos(self, videos: Sequence["VideoInput"], **kwargs) -> List[List["ImageObject"]]:
@@ -252,19 +298,28 @@ class BasePlugin:
         
         for video in videos:
             # 如果是 S3 上的视频，下载为临时文件
-            if 's3://' in video:
+            if "s3://" in video:
+                if client is None:
+                    raise ImportError(
+                        "petrel_client is required only for s3:// video paths, "
+                        "but it is not installed in the current environment."
+                    )
+        
                 video_bytes = client.get(video)
                 _, file_extension = os.path.splitext(video)
+        
                 with tempfile.NamedTemporaryFile(suffix=file_extension, delete=True) as temp_file:
                     temp_file.write(video_bytes)
+                    temp_file.flush()
                     video_path = temp_file.name
-                    if video_path.endswith('.gif'):
+        
+                    if video_path.endswith(".gif"):
                         frames = self.process_gif(video_path, **kwargs)
                     else:
                         frames = self.process_video(video_path, **kwargs)
             else:
                 video_path = video
-                if video_path.endswith('.gif'):
+                if video_path.endswith(".gif"):
                     frames = self.process_gif(video_path, **kwargs)
                 else:
                     frames = self.process_video(video_path, **kwargs)
@@ -693,40 +748,42 @@ class Qwen2vlPlugin(BasePlugin):
     ) -> Dict[str, "torch.Tensor"]:
         r"""
         Processes visual inputs.
-
+    
         Returns: (llava and paligemma)
             pixel_values: tensor with shape (B, C, H, W)
-
+    
         Returns: (qwen2-vl)
             pixel_values: tensor with shape (num_patches, patch_dim)
             image_grid_thw: tensor with shape (num_images, 3), where the three numbers are time, width, height
-
+    
         It holds num_patches == torch.prod(image_grid_thw)
         """
         image_processor: "BaseImageProcessor" = getattr(processor, "image_processor")
         video_processor: "BaseImageProcessor" = getattr(processor, "video_processor", image_processor)
+        fixed_video_frames = _get_env_int("LLAMAFACTORY_FIXED_VIDEO_FRAMES", 0)
+    
         input_dict = {"images": None}  # default key
         if len(images) != 0:
             images = self._regularize_images(
                 images,
                 image_resolution=getattr(processor, "image_resolution", 512),
-                min_pixels=getattr(processor, "video_maxlen", 4*28*28),
-                total_pixels=getattr(processor, "total_pixels", 8000)
+                min_pixels=getattr(processor, "video_maxlen", 4 * 28 * 28),
+                total_pixels=getattr(processor, "total_pixels", 8000),
             )
             input_dict["images"] = images
-
+    
         if len(videos) != 0:
             videos = self._regularize_videos(
                 videos,
                 image_resolution=getattr(processor, "video_resolution", 128),
                 video_fps=getattr(processor, "video_fps", 1.0),
                 video_maxlen=getattr(processor, "video_maxlen", 64),
-                min_pixels=getattr(processor, "video_maxlen", 4*28*28),
-                total_pixels=getattr(processor, "total_pixels", 8000)
+                min_pixels=getattr(processor, "video_maxlen", 4 * 28 * 28),
+                total_pixels=getattr(processor, "total_pixels", 8000),
+                fixed_video_frames=fixed_video_frames,
             )
             input_dict["videos"] = videos
-        
-
+    
         mm_inputs = {}
         if image_processor != video_processor:
             if input_dict.get("images") is not None:
@@ -735,7 +792,7 @@ class Qwen2vlPlugin(BasePlugin):
                 mm_inputs.update(video_processor(input_dict["videos"], return_tensors="pt"))
         elif input_dict.get("images") is not None or input_dict.get("videos") is not None:  # same processor (qwen2-vl)
             mm_inputs.update(image_processor(**input_dict, return_tensors="pt"))
-        # import pdb; pdb.set_trace()
+    
         return mm_inputs
 
     @override
