@@ -1481,6 +1481,14 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         # set which_rope mode at llama-factory: /mnt/petrelfs/weixilin/projects/MLLM/LLaMA-Factory/src/llamafactory/model/loader.py
         self.which_rope = "m_rope"
         self.padding_side = "left"  # set it to left by default, user can use setter to change padding_sides
+        
+        # ===== TemporalPE video config =====
+        # local window size for E[v^2] smoothing
+        self.temporalpe_window_size = 5
+        # numerical stability
+        self.temporalpe_eps = 1e-6
+        # cache latest per-video stats for debugging / later extension
+        self.temporalpe_stats = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1503,20 +1511,76 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    def _build_temporalpe_tau_from_video_embeds(
+    def _temporalpe_smooth_1d(self, x: torch.Tensor, window_size: int) -> torch.Tensor:
+        """
+        Local window average for E[v^2] in the current video implementation.
+        """
+        if x.numel() <= 1:
+            return x
+    
+        ks = int(window_size)
+        ks = min(ks, int(x.numel()))
+        if ks < 2:
+            return x
+        if ks % 2 == 0:
+            ks -= 1
+        if ks < 1:
+            return x
+    
+        pad = ks // 2
+        x_pad = F.pad(x.view(1, 1, -1), (pad, pad), mode="replicate")
+        x_smooth = F.avg_pool1d(x_pad, kernel_size=ks, stride=1)
+        return x_smooth.view(-1)
+
+
+    def _temporalpe_local_mad_variance(self, x: torch.Tensor, window_size: int, eps: float) -> torch.Tensor:
+        """
+        Keep an r estimate for future use.
+        Current video version does NOT put r into alpha yet.
+        """
+        if x.numel() == 0:
+            return x
+    
+        ks = int(window_size)
+        ks = min(ks, int(x.numel()))
+        if ks < 2:
+            return torch.zeros_like(x)
+        if ks % 2 == 0:
+            ks -= 1
+        if ks < 1:
+            return torch.zeros_like(x)
+    
+        pad = ks // 2
+        x_pad = F.pad(x.view(1, 1, -1), (pad, pad), mode="replicate").view(-1)
+        windows = x_pad.unfold(0, ks, 1)  # [N, ks]
+        median = windows.median(dim=-1).values
+        mad = (windows - median.unsqueeze(-1)).abs().median(dim=-1).values
+        return mad.pow(2).clamp_min(eps)
+    
+    
+    def _build_temporalpe_video_stats_from_video_embeds(
         self,
         video_embeds: torch.Tensor,
         video_grid_thw: torch.LongTensor,
-        scale_factor: float = 2.0,
-        eps: float = 1e-6,
+        window_size: Optional[int] = None,
+        eps: Optional[float] = None,
     ):
         """
-        video_embeds: [sum_i (T_i * H_i' * W_i'), D]
-        video_grid_thw: [num_videos, 3], each row = [T, H, W] before spatial_merge
-        return: list[tensor], each tensor shape [T_i], float tau for one video
+        Build per-video TemporalPE statistics from visual features.
+    
+        Current implementation choices:
+          - use feature-variation energy only
+          - keep an r estimate for future use, but DO NOT add it into alpha now
+          - use per-video global q
+          - assume discrete uniform frame interval, i.e. Delta t = 1
         """
+        if window_size is None:
+            window_size = int(getattr(self, "temporalpe_window_size", 5))
+        if eps is None:
+            eps = float(getattr(self, "temporalpe_eps", 1e-6))
+    
         spatial_merge_size = self.config.vision_config.spatial_merge_size
-        tau_list = []
+        stats_list = []
         st = 0
     
         for grid in video_grid_thw:
@@ -1525,39 +1589,88 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             gw = w // spatial_merge_size
             num_tokens = t * gh * gw
     
-            cur = video_embeds[st: st + num_tokens]   # [T*P, D]
+            cur = video_embeds[st : st + num_tokens]   # [T*P, D]
             st += num_tokens
     
-            cur = cur.view(t, gh * gw, -1).float()    # [T, P, D]
+            cur = cur.view(t, gh * gw, -1).float()     # [T, P, D]
             cur = F.layer_norm(cur, (cur.shape[-1],))
     
             # frame-level descriptor
-            frame_feat = cur.mean(dim=1)              # [T, D]
+            frame_feat = cur.mean(dim=1)               # [T, D]
     
             if t <= 1:
-                tau = torch.zeros(t, device=cur.device, dtype=torch.float32)
-            else:
-                diff = frame_feat[1:] - frame_feat[:-1]      # [T-1, D]
-                e = diff.pow(2).mean(dim=-1)                 # [T-1]
+                device = cur.device
+                dtype = torch.float32
+                empty = torch.zeros(0, device=device, dtype=dtype)
+                tau = torch.zeros(t, device=device, dtype=dtype)
+                q = torch.tensor(1.0, device=device, dtype=dtype)
     
-                # optional smoothing
-                if e.numel() >= 3:
-                    e = F.avg_pool1d(
-                        e[None, None, :], kernel_size=3, stride=1, padding=1
-                    ).squeeze(0).squeeze(0)
+                stats_list.append(
+                    {
+                        "tau": tau,
+                        "alpha": empty,
+                        "v_sq": empty,
+                        "v_sq_smooth": empty,
+                        "r": empty,
+                        "q": q,
+                    }
+                )
+                continue
     
-                q = e.mean().clamp_min(eps)
-                z = torch.cat(
-                    [torch.zeros(1, device=e.device, dtype=e.dtype), e / q],
-                    dim=0
-                )                                           # [T]
+            # v^2 from task-relevant video features
+            diff = frame_feat[1:] - frame_feat[:-1]    # [T-1, D]
+            v_sq = diff.pow(2).mean(dim=-1)            # [T-1]
     
-                tau = torch.cumsum(z, dim=0)                # [T]
+            # local window average E[v^2]
+            v_sq_smooth = self._temporalpe_smooth_1d(v_sq, window_size)
     
-            tau = tau * float(scale_factor)
-            tau_list.append(tau)
+            # keep an r estimate for future use, but DO NOT use it in alpha now
+            detail = v_sq - v_sq_smooth
+            r = self._temporalpe_local_mad_variance(detail, window_size, eps)
     
-        return tau_list
+            # per-video global calibration q
+            q = v_sq_smooth.mean().clamp_min(eps)
+    
+            # current stable version:
+            # alpha_k = E[v^2]_W / q
+            # with Delta t = 1 and r excluded from the coefficient formula for now
+            alpha = v_sq_smooth / q                    # [T-1]
+    
+            # tau_1 = 0, tau_k = sum_{j<k} alpha_j
+            z = torch.cat(
+                [torch.zeros(1, device=alpha.device, dtype=alpha.dtype), alpha],
+                dim=0,
+            )                                          # [T]
+            tau = torch.cumsum(z, dim=0)               # [T]
+    
+            stats_list.append(
+                {
+                    "tau": tau,
+                    "alpha": alpha,
+                    "v_sq": v_sq,
+                    "v_sq_smooth": v_sq_smooth,
+                    "r": r,
+                    "q": q,
+                }
+            )
+    
+        return stats_list
+    
+    
+    def _build_temporalpe_tau_from_video_embeds(
+        self,
+        video_embeds: torch.Tensor,
+        video_grid_thw: torch.LongTensor,
+    ):
+        """
+        Return only tau for downstream use, while keeping full stats in self.temporalpe_stats.
+        """
+        stats_list = self._build_temporalpe_video_stats_from_video_embeds(
+            video_embeds=video_embeds,
+            video_grid_thw=video_grid_thw,
+        )
+        self.temporalpe_stats = stats_list
+        return [stats["tau"] for stats in stats_list]
 
     def _resolve_which_rope(self, which_rope: Optional[str] = None) -> str:
         if which_rope is None:
@@ -1609,10 +1722,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             if video_embeds_for_tau is None:
                 raise ValueError("temporalpe_videorope requires video_embeds_for_tau")
     
+            # tau is built first; delta / scale_factor is applied outside tau later
             video_tau_list = self._build_temporalpe_tau_from_video_embeds(
                 video_embeds_for_tau.float(),
                 video_grid_thw,
-                scale_factor=scale_factor,
             )
     
             return self.get_temporalpe_videorope_index(
@@ -1662,6 +1775,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         """
         Keep VideoRoPE's diagonal x/y layout unchanged.
         Replace only temporal index t with reconstructed tau.
+        The adjustable temporal spacing factor delta (= scale_factor) is applied OUTSIDE tau.
         """
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_token_id = self.config.image_token_id
@@ -1742,10 +1856,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                         ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
                         base_t = base_t * float(scale_factor)
                     else:
-                        # video case: replace temporal index with reconstructed tau
+                        # video case: use reconstructed tau first, then apply delta outside tau
                         tau = video_tau_list[video_index].to(input_ids.device).float()   # [T]
-                        # print("video tau:", tau)
                         base_t = tau.view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                        base_t = base_t * float(scale_factor)
                         video_index += 1
     
                     h_index = torch.arange(

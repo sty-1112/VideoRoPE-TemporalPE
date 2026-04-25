@@ -14,17 +14,15 @@ LOG_FILE="log/longvideobench_${timestamp}.log"
 : > "${LOG_FILE}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-unset OMP_NUM_THREADS
+export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=8
 export CUDA_VISIBLE_DEVICES=0
+export DECORD_EOF_RETRY_MAX=20480
 
 EXP_ROOT="${REPO_ROOT}/videorope_exp"
 CKPT_DIR="${EXP_ROOT}/checkpoints"
 DATA_ROOT="${EXP_ROOT}/datasets/LongVideoBench"
 
-# -----------------------------
-# 自动寻找 LongVideoBench 标注与视频目录
-# -----------------------------
 if [[ -f "${DATA_ROOT}/json/lvb_val.json" ]]; then
   EVAL_QA_ROOT="${DATA_ROOT}/json/lvb_val.json"
 elif [[ -f "${DATA_ROOT}/lvb_val.json" ]]; then
@@ -42,7 +40,7 @@ if [[ -d "${DATA_ROOT}/videos" ]]; then
 elif [[ -d "${DATA_ROOT}/video" ]]; then
   EVAL_VIDEO_ROOT="${DATA_ROOT}/video"
 else
-  echo "[WARN] 未发现 videos/ 子目录，默认把 ${DATA_ROOT} 当作视频根目录"
+  echo "[WARN] 未发现 videos/ 或 video/，默认把 ${DATA_ROOT} 当作视频根目录"
   EVAL_VIDEO_ROOT="${DATA_ROOT}"
 fi
 
@@ -52,31 +50,30 @@ fi
 #   CUDA_VISIBLE_DEVICES=0 bash scripts/run_longvideobench_all.sh
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/run_longvideobench_all.sh
 # -----------------------------
-gpu_list="${CUDA_VISIBLE_DEVICES:-0}"
-IFS=',' read -ra GPULIST <<< "${gpu_list}"
-CHUNKS=${#GPULIST[@]}
-
-export DECORD_EOF_RETRY_MAX="${DECORD_EOF_RETRY_MAX:-20480}"
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
 MIN_PIXELS_FACTOR=144
 # CONTEXT_LENGTHS=(8192 16384 32768 64000)
-CONTEXT_LENGTHS=(8192)
-# CONTEXT_LENGTHS=(64000)
+CONTEXT_LENGTHS=(8192 16384 32768)
+
+# MODEL_LIST=(
+#   "Qwen2-VL-vanilla_rope-128frames-8k-context-330k-llava-video vanilla_rope 1.0"
+#   "Qwen2-VL-tad_rope-128frames-8k-context-330k-llava-video tad_rope 1.0"
+#   "Qwen2-VL-m_rope-128frames-8k-context-330k-llava-video m_rope 1.0"
+#   "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video videorope 2.0"
+# )
 
 MODEL_LIST=(
-  "Qwen2-VL-vanilla_rope-128frames-8k-context-330k-llava-video vanilla_rope 1.0"
-  "Qwen2-VL-tad_rope-128frames-8k-context-330k-llava-video tad_rope 1.0"
-  "Qwen2-VL-m_rope-128frames-8k-context-330k-llava-video m_rope 1.0"
-  "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video videorope 2.0"
+  # "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video videorope 2.0"
+  "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video temporalpe_videorope 2.0"
+  # "Qwen2-VL-vanilla_rope-128frames-8k-context-330k-llava-video vanilla_rope 1.0"
+  # "Qwen2-VL-tad_rope-128frames-8k-context-330k-llava-video tad_rope 1.0"
+  # "Qwen2-VL-m_rope-128frames-8k-context-330k-llava-video m_rope 1.0"
 )
 
 echo "[INFO] REPO_ROOT=${REPO_ROOT}"
 echo "[INFO] CKPT_DIR=${CKPT_DIR}"
 echo "[INFO] EVAL_QA_ROOT=${EVAL_QA_ROOT}"
 echo "[INFO] EVAL_VIDEO_ROOT=${EVAL_VIDEO_ROOT}"
-echo "[INFO] GPU_LIST=${gpu_list}"
-echo "[INFO] CHUNKS=${CHUNKS}"
 
 for MODEL_ENTRY in "${MODEL_LIST[@]}"; do
   CKPT=$(echo "${MODEL_ENTRY}" | awk '{print $1}')
@@ -89,30 +86,44 @@ for MODEL_ENTRY in "${MODEL_LIST[@]}"; do
   fi
 
   for context_length in "${CONTEXT_LENGTHS[@]}"; do
-    OUTPUT_FOLDER="playground/results/longvideobench/${CKPT}-${context_length}-${MIN_PIXELS_FACTOR}tokens-clean_subtitles"
+    OUTPUT_FOLDER="playground/results/longvideobench/${WHICH_ROPE}-${context_length}-${MIN_PIXELS_FACTOR}tokens-clean_subtitles"
     mkdir -p "${OUTPUT_FOLDER}"
 
     echo "[INFO] Running ${CKPT} | rope=${WHICH_ROPE} | scale=${SCALE_FACTOR} | ctx=${context_length}"
 
-    for IDX in $(seq 0 $((CHUNKS - 1))); do
-      CUDA_VISIBLE_DEVICES="${GPULIST[$IDX]}" python -m eval.model_longvideobench_qwen2_vl \
-        --model-path "${CKPT_DIR}/${CKPT}" \
-        --max_new_tokens 128 \
-        --Eval_QA_root "${EVAL_QA_ROOT}" \
-        --Eval_Video_root "${EVAL_VIDEO_ROOT}" \
-        --chat_conversation_output_folder "${OUTPUT_FOLDER}" \
-        --context_length "${context_length}" \
-        --num-chunks "${CHUNKS}" \
-        --chunk-idx "${IDX}" \
-        --which_rope "${WHICH_ROPE}" \
-        --scale_factor "${SCALE_FACTOR}" \
-        --nframes 48 \
-        --clean_subtitles \
-        --min_pixels $(( MIN_PIXELS_FACTOR * 28 * 28 )) &
-    done
+    CUDA_VISIBLE_DEVICES=0 python -u -m eval.model_longvideobench_qwen2_vl \
+      --model-path "${CKPT_DIR}/${CKPT}" \
+      --max_new_tokens 128 \
+      --Eval_QA_root "${EVAL_QA_ROOT}" \
+      --Eval_Video_root "${EVAL_VIDEO_ROOT}" \
+      --chat_conversation_output_folder "${OUTPUT_FOLDER}" \
+      --context_length "${context_length}" \
+      --num-chunks 1 \
+      --chunk-idx 0 \
+      --which_rope "${WHICH_ROPE}" \
+      --scale_factor "${SCALE_FACTOR}" \
+      --nframes 48 \
+      --clean_subtitles \
+      --min_pixels $(( MIN_PIXELS_FACTOR * 28 * 28 ))
 
-    wait
+    RESULT_JSON="${OUTPUT_FOLDER}/0.json"
+    if [[ ! -f "${RESULT_JSON}" ]]; then
+      echo "[ERROR] 结果文件不存在: ${RESULT_JSON}"
+      exit 1
+    fi
+
+    LINE_COUNT=$(wc -l < "${RESULT_JSON}")
+    echo "[INFO] ${RESULT_JSON} line_count=${LINE_COUNT}"
+
+    if [[ "${LINE_COUNT}" -ne 964 ]]; then
+      echo "[ERROR] LongVideoBench clean_subtitles 结果数不是 964，而是 ${LINE_COUNT}"
+      exit 1
+    fi
 
     python eval/check_long_video_bench.py "${OUTPUT_FOLDER}"
+
+    echo "[INFO] upload_board.json for ${CKPT}:"
+    cat "${OUTPUT_FOLDER}/upload_board.json"
+    echo
   done
 done

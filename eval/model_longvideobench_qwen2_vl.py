@@ -35,6 +35,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from peft import PeftModel
 from qwen_vl_utils import process_vision_info
 
 # -----------------------------------------------------------------------------
@@ -175,6 +176,57 @@ def get_video_shape_str(video_inputs) -> str:
 # -----------------------------------------------------------------------------
 # Main evaluation
 # -----------------------------------------------------------------------------
+def _is_lora_adapter_dir(path: str) -> bool:
+    if path is None:
+        return False
+    return os.path.isfile(os.path.join(path, "adapter_config.json"))
+
+
+def _load_qwen2vl_for_eval(model_path: str, model_base: Optional[str], context_length: int):
+    """
+    Support both:
+      1) full / merged model directory
+      2) LoRA adapter directory + base model directory
+    """
+    is_lora = _is_lora_adapter_dir(model_path)
+
+    # vLLM path cannot directly load LoRA adapter dirs here.
+    # For LoRA evaluation, keep context_length < 48000 unless you merge adapters offline first.
+    if is_lora and context_length >= 48000:
+        raise ValueError(
+            "LoRA adapter directory is not supported in the vLLM path. "
+            "Please either (1) keep context_length < 48000, or "
+            "(2) merge the LoRA adapter into a full model first."
+        )
+
+    if is_lora:
+        if model_base is None:
+            raise ValueError(
+                "Detected a LoRA adapter directory, but --model-base was not provided."
+            )
+
+        base_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_base,
+            device_map="cpu",
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        model = PeftModel.from_pretrained(base_model, model_path)
+        model = model.merge_and_unload()
+        processor_path = model_base
+    else:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_path,
+            device_map="cpu",
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
+        processor_path = model_path
+
+    model = model.to("cuda")
+    model = model.eval()
+    return model, processor_path, is_lora
+
 def eval_dataset(args):
     min_pixels = args.min_pixels
     max_pixels = args.max_pixels
@@ -212,8 +264,16 @@ def eval_dataset(args):
     model = None
 
     total_pixels = int((context_length - 512) * 28 * 28)
+    model_base = os.path.expanduser(args.model_base) if args.model_base is not None else None
+    is_lora = _is_lora_adapter_dir(model_path)
 
     if context_length >= 48000:
+        if is_lora:
+            raise ValueError(
+                "LoRA adapter directory cannot be evaluated through the vLLM path directly. "
+                "Please merge the adapter first or keep context_length < 48000."
+            )
+
         # lazy import vllm only when needed
         from vllm import LLM, SamplingParams
 
@@ -232,26 +292,24 @@ def eval_dataset(args):
             presence_penalty=0,
             frequency_penalty=0,
         )
+        processor_path = model_path
     else:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_path,
-            device_map="cpu",
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+        model, processor_path, is_lora = _load_qwen2vl_for_eval(
+            model_path=model_path,
+            model_base=model_base,
+            context_length=context_length,
         )
-        model = model.to("cuda")
-        model = model.eval()
 
     if args.nframes is None:
         processor = AutoProcessor.from_pretrained(
-            model_path,
+            processor_path,
             min_pixels=min_pixels,
             total_pixels=total_pixels,
             use_fast=False,
         )
     else:
         processor = AutoProcessor.from_pretrained(
-            model_path,
+            processor_path,
             min_pixels=min_pixels,
             max_pixels=min_pixels,
             nframes=args.nframes,

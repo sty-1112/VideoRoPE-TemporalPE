@@ -7,9 +7,10 @@ set -x
 #   ROPE_MODE=temporalpe_videorope bash scripts/run_temporalpe_videorope_ft.sh
 #
 # 可选：
+#   DATASET_NAME=webvid_videoweave_l2_f8_video_sharegpt_pilot512
 #   DATASET_NAME=webvid_videoweave_l2_f8_video_sharegpt
 #   BASE_MODEL_PATH=/absolute/path/to/Qwen2-VL-7B-Instruct-with-Qwen2-Language-Backbone
-#   CUDA_VISIBLE_DEVICES=0,1,2,3
+#   CUDA_VISIBLE_DEVICES=0
 #   FULL_BATCH_SIZE=4
 #   PER_DEVICE_BATCH_SIZE=1
 
@@ -29,20 +30,19 @@ export NCCL_DEBUG=INFO
 export DECORD_EOF_RETRY_MAX="${DECORD_EOF_RETRY_MAX:-20480}"
 export PYTHONPATH="${REPO_ROOT}:${LF_ROOT}/src:${PYTHONPATH:-}"
 
-# 调试相关；稳定后可按需关闭
+# 调试时建议打开；后续稳定后可关
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
-export TORCH_SHOW_CPP_STACKTRACES="${TORCH_SHOW_CPP_STACKTRACES:-0}"
-export TORCH_DISABLE_ADDR2LINE="${TORCH_DISABLE_ADDR2LINE:-1}"
+export TORCH_SHOW_CPP_STACKTRACES="${TORCH_SHOW_CPP_STACKTRACES:-1}"
 
 # 强制 LLaMA-Factory 加载本地 videorope-transformer/modeling_videorope.py
 export USE_LOCAL_VIDEOROPE_QWEN2VL=1
 
-# 对已经渲染好的 16 帧视频，训练时固定取 16 帧
+# 对已经渲染好的 16 帧视频，训练时固定取 16 帧，不再按 fps / duration 重新缩减
 export LLAMAFACTORY_FIXED_VIDEO_FRAMES="${LLAMAFACTORY_FIXED_VIDEO_FRAMES:-16}"
 
 # ===== 数据 =====
 export DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/videorope_exp/datasets/llamafactory_webvid_video_full}"
-export DATASET_NAME="${DATASET_NAME:-webvid_videoweave_l2_f8_video_sharegpt}"
+export DATASET_NAME="${DATASET_NAME:-webvid_videoweave_l2_f8_video_sharegpt_pilot512}"
 
 # ===== 模型 =====
 LOCAL_BASE_MODEL_DIR="${REPO_ROOT}/videorope_exp/checkpoints/Qwen2-VL-7B-Instruct-with-Qwen2-Language-Backbone"
@@ -60,9 +60,7 @@ export ROPE_MODE="${ROPE_MODE:-videorope}"
 # ===== 输出 =====
 export JOB_NAME="${ROPE_MODE}-${DATASET_NAME}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/videorope_exp/checkpoints/Qwen2-VL-${JOB_NAME}}"
-
-# 10k 重新构建 tokenized cache，避免复用 pilot512 或旧验证划分
-export TOKENIZED_PATH="${TOKENIZED_PATH:-${LF_ROOT}/cache/tokenized-${DATASET_NAME}-frames${LLAMAFACTORY_FIXED_VIDEO_FRAMES}-val256}"
+export TOKENIZED_PATH="${TOKENIZED_PATH:-${LF_ROOT}/cache/tokenized-${DATASET_NAME}-frames${LLAMAFACTORY_FIXED_VIDEO_FRAMES}-val32}"
 
 # ===== 日志 =====
 export LOG_DIR="${LOG_DIR:-${REPO_ROOT}/videorope_exp/logs}"
@@ -87,17 +85,12 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export VIDEO_FPS="${VIDEO_FPS:-4.0}"
 export VIDEO_MAXLEN="${VIDEO_MAXLEN:-16}"
 export TOTAL_PIXELS="${TOTAL_PIXELS:-1806336}"
-
 export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1.0}"
 export LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 export WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 export PREPROCESSING_WORKERS="${PREPROCESSING_WORKERS:-8}"
-
-# 10k 时把日志/保存/验证频率调稀一点
-export VAL_SIZE="${VAL_SIZE:-256}"
-export LOGGING_STEPS="${LOGGING_STEPS:-10}"
-export SAVE_STEPS="${SAVE_STEPS:-250}"
-export EVAL_STEPS="${EVAL_STEPS:-250}"
+export LOGGING_STEPS="${LOGGING_STEPS:-1}"
+export SAVE_STEPS="${SAVE_STEPS:-50}"
 
 echo "==================================================" | tee -a "${LOG_FILE}"
 echo "JOB_NAME=${JOB_NAME}" | tee -a "${LOG_FILE}"
@@ -111,7 +104,6 @@ echo "LOG_FILE=${LOG_FILE}" | tee -a "${LOG_FILE}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" | tee -a "${LOG_FILE}"
 echo "VIDEO_MAXLEN=${VIDEO_MAXLEN}" | tee -a "${LOG_FILE}"
 echo "TOTAL_PIXELS=${TOTAL_PIXELS}" | tee -a "${LOG_FILE}"
-echo "VAL_SIZE=${VAL_SIZE}" | tee -a "${LOG_FILE}"
 echo "==================================================" | tee -a "${LOG_FILE}"
 
 torchrun \
@@ -141,7 +133,7 @@ torchrun \
   --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
   --logging_steps "${LOGGING_STEPS}" \
   --save_steps "${SAVE_STEPS}" \
-  --save_total_limit 3 \
+  --save_total_limit 2 \
   --plot_loss true \
   --overwrite_output_dir true \
   --per_device_train_batch_size "${PER_DEVICE_BATCH_SIZE}" \
@@ -152,10 +144,11 @@ torchrun \
   --gradient_checkpointing true \
   --bf16 true \
   --ddp_timeout 180000000 \
-  --val_size "${VAL_SIZE}" \
+  --val_size 32 \
+  --val_size 32 \
   --per_device_eval_batch_size 1 \
   --eval_strategy steps \
-  --eval_steps "${EVAL_STEPS}" \
+  --eval_steps 20 \
   --which_rope "${ROPE_MODE}" \
   --report_to none \
   2>&1 | tee -a "${LOG_FILE}"
