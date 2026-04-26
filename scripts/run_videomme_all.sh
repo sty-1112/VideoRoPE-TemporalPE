@@ -67,10 +67,10 @@ CONTEXT_LENGTHS=(8192)
 #   __NONE__ 表示完整模型目录
 #   否则表示 LoRA adapter 需要加载的 base model
 MODEL_LIST=(
-  "Qwen2-VL-7B-Instruct-with-Qwen2-Language-Backbone m_rope 1.0 __NONE__"
-  "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video videorope 2.0 __NONE__"
+  # "Qwen2-VL-7B-Instruct-with-Qwen2-Language-Backbone m_rope 1.0 __NONE__"
   "Qwen2-VL-videorope-webvid_videoweave_l2_f8_video_sharegpt videorope 2.0 ${BASE_MODEL_PATH}"
   "Qwen2-VL-temporalpe_videorope-webvid_videoweave_l2_f8_video_sharegpt temporalpe_videorope 2.0 ${BASE_MODEL_PATH}"
+  "Qwen2-VL-videorope-128frames-8k-context-330k-llava-video videorope 2.0 __NONE__"
 )
 
 echo "[INFO] REPO_ROOT=${REPO_ROOT}"

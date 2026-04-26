@@ -88,6 +88,21 @@
         7z x "$z" -o./videos -aos
       done
       7z x subtitle.zip -o./subtitles -aos
+
+      python - <<'PY'
+        import os
+        import pandas as pd
+        
+        src = "videomme/test-00000-of-00001.parquet"
+        dst = "Video-MME.tsv"
+        
+        df = pd.read_parquet(src)
+        df.to_csv(dst, sep="\t", index=False)
+        
+        print("saved:", os.path.abspath(dst))
+        print("rows:", len(df))
+        print("columns:", list(df.columns))
+        PY
     ```
 
 # VideoWeave-style WebVid-10K Pipeline
