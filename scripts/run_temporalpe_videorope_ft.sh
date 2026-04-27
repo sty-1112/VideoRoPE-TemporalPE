@@ -9,9 +9,7 @@ set -x
 # 可选：
 #   DATASET_NAME=webvid_videoweave_l2_f8_video_sharegpt
 #   BASE_MODEL_PATH=/absolute/path/to/Qwen2-VL-7B-Instruct-with-Qwen2-Language-Backbone
-#   CUDA_VISIBLE_DEVICES=0,1,2,3
-#   FULL_BATCH_SIZE=4
-#   PER_DEVICE_BATCH_SIZE=1
+#   CUDA_VISIBLE_DEVICES=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -20,7 +18,8 @@ LF_ROOT="${REPO_ROOT}/LLaMA-Factory"
 cd "${LF_ROOT}"
 
 # ===== 基本环境 =====
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+# 单 GPU 默认值
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 IFS=',' read -ra GPULIST <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_GPUS="${#GPULIST[@]}"
 
@@ -58,11 +57,11 @@ fi
 export ROPE_MODE="${ROPE_MODE:-videorope}"
 
 # ===== 输出 =====
-export JOB_NAME="${ROPE_MODE}-${DATASET_NAME}"
+export JOB_NAME="${ROPE_MODE}-${DATASET_NAME}-1gpu-qk-lora"
 export OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/videorope_exp/checkpoints/Qwen2-VL-${JOB_NAME}}"
 
-# 10k 重新构建 tokenized cache，避免复用 pilot512 或旧验证划分
-export TOKENIZED_PATH="${TOKENIZED_PATH:-${LF_ROOT}/cache/tokenized-${DATASET_NAME}-frames${LLAMAFACTORY_FIXED_VIDEO_FRAMES}-val256}"
+# 单卡重新构建 cache，避免复用旧验证划分
+export TOKENIZED_PATH="${TOKENIZED_PATH:-${LF_ROOT}/cache/tokenized-${DATASET_NAME}-frames${LLAMAFACTORY_FIXED_VIDEO_FRAMES}-val128-1gpu-qk}"
 
 # ===== 日志 =====
 export LOG_DIR="${LOG_DIR:-${REPO_ROOT}/videorope_exp/logs}"
@@ -71,8 +70,10 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 export LOG_FILE="${LOG_FILE:-${LOG_DIR}/${JOB_NAME}_${TIMESTAMP}.log}"
 
 # ===== 训练超参 =====
-export FULL_BATCH_SIZE="${FULL_BATCH_SIZE:-4}"
+# 单卡上建议更保守，避免把 base model 拉偏
+export FULL_BATCH_SIZE="${FULL_BATCH_SIZE:-1}"
 export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-1}"
+
 GRAD_ACC=$(( FULL_BATCH_SIZE / (PER_DEVICE_BATCH_SIZE * NUM_GPUS) ))
 if [[ "${GRAD_ACC}" -lt 1 ]]; then
   GRAD_ACC=1
@@ -88,16 +89,17 @@ export VIDEO_FPS="${VIDEO_FPS:-4.0}"
 export VIDEO_MAXLEN="${VIDEO_MAXLEN:-16}"
 export TOTAL_PIXELS="${TOTAL_PIXELS:-1806336}"
 
-export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1.0}"
-export LEARNING_RATE="${LEARNING_RATE:-1e-5}"
-export WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
-export PREPROCESSING_WORKERS="${PREPROCESSING_WORKERS:-8}"
+# 更保守的训练配方
+export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-0.5}"
+export LEARNING_RATE="${LEARNING_RATE:-5e-6}"
+export WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
+export PREPROCESSING_WORKERS="${PREPROCESSING_WORKERS:-4}"
 
-# 10k 时把日志/保存/验证频率调稀一点
-export VAL_SIZE="${VAL_SIZE:-256}"
-export LOGGING_STEPS="${LOGGING_STEPS:-10}"
-export SAVE_STEPS="${SAVE_STEPS:-250}"
-export EVAL_STEPS="${EVAL_STEPS:-250}"
+# 单卡减少验证和保存频率
+export VAL_SIZE="${VAL_SIZE:-128}"
+export LOGGING_STEPS="${LOGGING_STEPS:-20}"
+export SAVE_STEPS="${SAVE_STEPS:-500}"
+export EVAL_STEPS="${EVAL_STEPS:-500}"
 
 echo "==================================================" | tee -a "${LOG_FILE}"
 echo "JOB_NAME=${JOB_NAME}" | tee -a "${LOG_FILE}"
@@ -109,9 +111,15 @@ echo "OUTPUT_DIR=${OUTPUT_DIR}" | tee -a "${LOG_FILE}"
 echo "TOKENIZED_PATH=${TOKENIZED_PATH}" | tee -a "${LOG_FILE}"
 echo "LOG_FILE=${LOG_FILE}" | tee -a "${LOG_FILE}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" | tee -a "${LOG_FILE}"
+echo "NUM_GPUS=${NUM_GPUS}" | tee -a "${LOG_FILE}"
 echo "VIDEO_MAXLEN=${VIDEO_MAXLEN}" | tee -a "${LOG_FILE}"
 echo "TOTAL_PIXELS=${TOTAL_PIXELS}" | tee -a "${LOG_FILE}"
 echo "VAL_SIZE=${VAL_SIZE}" | tee -a "${LOG_FILE}"
+echo "FULL_BATCH_SIZE=${FULL_BATCH_SIZE}" | tee -a "${LOG_FILE}"
+echo "PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE}" | tee -a "${LOG_FILE}"
+echo "GRAD_ACC=${GRAD_ACC}" | tee -a "${LOG_FILE}"
+echo "LEARNING_RATE=${LEARNING_RATE}" | tee -a "${LOG_FILE}"
+echo "NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS}" | tee -a "${LOG_FILE}"
 echo "==================================================" | tee -a "${LOG_FILE}"
 
 torchrun \
@@ -123,7 +131,7 @@ torchrun \
   --stage sft \
   --do_train true \
   --finetuning_type lora \
-  --lora_target all \
+  --lora_target q_proj,k_proj \
   --lora_rank 64 \
   --lora_alpha 128 \
   --lora_dropout 0.05 \
